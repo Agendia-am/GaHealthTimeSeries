@@ -8,6 +8,8 @@ import io
 import os
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import spacy
 from spacy.pipeline import EntityRuler
 from dataclasses import dataclass, asdict, field
@@ -63,22 +65,27 @@ def wayback_lookup(url: str, session: requests.Session) -> Optional[str]:
     return None
 
 
-def fetch_html(url: str, session: requests.Session) -> tuple[str, str]:
+def fetch_html(url: str, session: requests.Session) -> tuple[str, str] | tuple[None, None]:
     """Fetch HTML for *url*.  Falls back to Wayback Machine API on failure.
-    Returns (html_text, source) where source is 'live' or 'wayback'."""
+    Returns (html_text, source) where source is 'live' or 'wayback'.
+    Returns (None, None) if both fail — caller should skip this URL."""
     try:
         resp = session.get(url, timeout=session._default_timeout)
         resp.raise_for_status()
         return resp.text, "live"
     except requests.RequestException:
         print(f"    [API] Live fetch failed, trying Wayback Machine API …")
-        wb_url = wayback_lookup(url, session)
-        if wb_url:
-            resp = session.get(wb_url, timeout=session._default_timeout)
-            resp.raise_for_status()
-            print(f"    [API] ✓ Got cached version from Wayback Machine")
-            return resp.text, "wayback"
-        raise
+        try:
+            wb_url = wayback_lookup(url, session)
+            if wb_url:
+                resp = session.get(wb_url, timeout=session._default_timeout)
+                resp.raise_for_status()
+                print(f"    [API] ✓ Got cached version from Wayback Machine")
+                return resp.text, "wayback"
+        except Exception:
+            pass
+        print(f"    [API] ✗ Both live and Wayback failed — skipping {url[:70]}")
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +162,111 @@ def extract_pdf_data(pdf_url: str, session: requests.Session):
             os.unlink(tmp_path)
 
     return full_text.strip(), chunks
+
+
+# ---------------------------------------------------------------------------
+# Recursive Deep Crawl – follow every internal DCH link
+# ---------------------------------------------------------------------------
+
+# Thread-safe visited set shared across all parallel workers
+_visited_lock = threading.Lock()
+
+
+def _mark_visited(url: str, visited: set) -> bool:
+    """Thread-safely check-and-add *url* to *visited*.  Returns True if new."""
+    normalised = url.split("?")[0].split("#")[0].rstrip("/")
+    with _visited_lock:
+        if normalised in visited:
+            return False
+        visited.add(normalised)
+        return True
+
+
+def deep_crawl_dch(
+    start_url: str,
+    session: requests.Session,
+    *,
+    max_depth: int = 3,
+    visited: set | None = None,
+    _depth: int = 0,
+) -> tuple[str, str, list[str]]:
+    """Crawl *start_url*, following only links **inside the article body**.
+
+    This avoids spidering the entire site via nav / sidebar / footer links.
+    PDFs found anywhere on the page are extracted immediately.
+    A shared *visited* set (thread-safe) prevents duplicate fetches.
+
+    Returns (body_text, pdf_text, chunks).
+    """
+    if visited is None:
+        visited = set()
+
+    if not _mark_visited(start_url, visited) or _depth > max_depth:
+        return "", "", []
+
+    body_text = ""
+    pdf_text = ""
+    chunks: list[str] = []
+
+    html, _src = fetch_html(start_url, session)
+    if html is None:
+        return "", "", []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- locate the article content area ---
+    content_area = (
+        soup.select_one(".field--name-body") or
+        soup.select_one(".field-name-body") or
+        soup.select_one("article") or
+        soup.select_one(".content")
+    )
+    if content_area:
+        body_text = clean_text(content_area.get_text(separator=" ", strip=True))
+    else:
+        body_text = clean_text(soup.get_text(separator=" ", strip=True))
+        content_area = soup  # fallback: scan entire page
+
+    if _depth > 0:
+        tag = "sub-page" if _depth == 1 else f"depth-{_depth}"
+        print(f"      [{tag}] {start_url[:80]}")
+
+    # --- only follow links INSIDE the content area (not nav/footer) ---
+    child_links: list[str] = []
+    for a_tag in content_area.find_all("a", href=True):
+        href = a_tag["href"]
+
+        # Build absolute URL
+        if href.startswith("/"):
+            href = "https://dch.georgia.gov" + href
+        elif not href.startswith("http"):
+            continue  # skip mailto:, javascript:, etc.
+
+        href_clean = href.split("?")[0].split("#")[0].rstrip("/")
+
+        # PDF → extract immediately
+        if href.lower().endswith(".pdf") or "/files/" in href.lower():
+            if _mark_visited(href, visited):
+                print(f"      [pdf] {href[:80]}")
+                ptxt, pchunks = extract_pdf_data(href, session)
+                pdf_text += " " + ptxt
+                chunks.extend(pchunks)
+        # Internal DCH page → queue for recursive crawl
+        elif "dch.georgia.gov" in href_clean:
+            if not re.search(r"\.(css|js|jpg|png|gif|svg|ico|xml|rss)$", href, re.I):
+                child_links.append(href)
+
+    # --- recurse into child DCH content pages ---
+    for child_url in child_links:
+        c_body, c_pdf, c_chunks = deep_crawl_dch(
+            child_url, session,
+            max_depth=max_depth, visited=visited, _depth=_depth + 1,
+        )
+        body_text += " " + c_body
+        pdf_text += " " + c_pdf
+        chunks.extend(c_chunks)
+
+    return body_text.strip(), pdf_text.strip(), chunks
 
 
 # ---------------------------------------------------------------------------
@@ -235,123 +347,202 @@ class ArticleRecord:
 # Extraction & Analysis
 # ---------------------------------------------------------------------------
 
-def analyze_for_metrics(text):
-    """Extracts numeric values related to healthcare categories from text."""
+# Keywords for each category — expanded for maximum capture
+_CATEGORY_KEYWORDS = {
+    "grants":              ["grant", "funded", "funding", "mini-grant", "award grant"],
+    "awarded":             ["award", "won", "received", "selected", "approv", "boost",
+                            "invest", "infus", "total"],
+    "budgets_allocated":   ["budget", "allocat", "appropriat", "spend", "expenditure",
+                            "outlay", "fiscal", "sfy", "fy"],
+    "federal_matching":    ["fmap", "federal match", "federal share", "match rate",
+                            "federal fund", "cms approv", "medicaid fund"],
+    "provider_counts":     ["provider", "hospital", "facilit", "clinic", "physician",
+                            "nurse", "consultant", "lactation"],
+    "enrollment_snapshots":["enroll", "member", "beneficiar", "recipient", "particip",
+                            "eligible", "covered", "insured", "uninsured"],
+    "waiver_approvals":    ["waiver", "1115", "1332", "1135", "1915", "appendix k",
+                            "demonstration", "renewal", "amend"],
+    "managed_contracts":   ["contract", "managed", "cmo", "procurement", "vendor",
+                            "rfp", "solicitation", "bid", "proposal", "d-snp",
+                            "care management", "benefit manager", "pbm", "pace"],
+    "reimbursement_rates": ["reimburs", "rate", "payment", "copay", "co-pay",
+                            "premium", "cost", "fee", "per diem", "directed pay"],
+}
+
+
+def analyze_for_metrics(text: str) -> dict[str, str]:
+    """Extract EVERY number from *text* and sort into healthcare categories.
+
+    • Uses spaCy NER (MONEY, PERCENT, CARDINAL, QUANTITY, ORDINAL, DATE).
+    • Also runs regex to catch dollar amounts and percentages spaCy misses.
+    • Every number is placed in every category whose keywords appear in the
+      surrounding context.  Numbers that match NO category still go into
+      the nearest plausible column so nothing is lost.
+    """
     doc = nlp(text)
-    data = {
-        "grants": [], "awarded": [], "budgets_allocated": [],
-        "federal_matching": [], "provider_counts": [],
-        "enrollment_snapshots": [], "waiver_approvals": [],
-        "managed_contracts": [], "reimbursement_rates": []
-    }
+    data: dict[str, list[str]] = {k: [] for k in _CATEGORY_KEYWORDS}
+
+    # --- 1. spaCy named entities that look like numbers ---
+    number_labels = {"MONEY", "PERCENT", "CARDINAL", "QUANTITY", "ORDINAL"}
+    seen_spans: set[tuple[int, int]] = set()          # avoid double-counting
 
     for ent in doc.ents:
-        if ent.label_ in ["MONEY", "PERCENT", "CARDINAL"]:
-            context = doc[max(ent.start - 10, 0) : min(ent.end + 10, len(doc))].text.lower()
+        if ent.label_ not in number_labels:
+            continue
+        span_key = (ent.start, ent.end)
+        if span_key in seen_spans:
+            continue
+        seen_spans.add(span_key)
 
-            if "grant" in context: data["grants"].append(ent.text)
-            if "award" in context: data["awarded"].append(ent.text)
-            if "budget" in context or "allocat" in context: data["budgets_allocated"].append(ent.text)
-            if "fmap" in context or "federal match" in context: data["federal_matching"].append(ent.text)
-            if "provider" in context: data["provider_counts"].append(ent.text)
-            if "enroll" in context: data["enrollment_snapshots"].append(ent.text)
-            if "waiver" in context: data["waiver_approvals"].append(ent.text)
-            if "managed" in context or "contract" in context: data["managed_contracts"].append(ent.text)
-            if "reimbursement" in context: data["reimbursement_rates"].append(ent.text)
+        context = doc[max(ent.start - 15, 0): min(ent.end + 15, len(doc))].text.lower()
+        matched = False
+        for cat, keywords in _CATEGORY_KEYWORDS.items():
+            if any(kw in context for kw in keywords):
+                data[cat].append(ent.text)
+                matched = True
+        if not matched:
+            # Put uncategorized money in 'awarded', others in closest fit
+            if ent.label_ == "MONEY":
+                data["awarded"].append(ent.text)
+            elif ent.label_ == "PERCENT":
+                data["reimbursement_rates"].append(ent.text)
+            else:
+                data["enrollment_snapshots"].append(ent.text)
 
-    return {k: ", ".join(set(v)) for k, v in data.items()}
+    # --- 2. Regex fallback: catch $X / X% patterns spaCy may miss ---
+    for m in re.finditer(
+        r"\$[\d,]+(?:\.\d+)?\s*(?:million|billion|thousand|[MBKmk])?"
+        r"|[\d,]+(?:\.\d+)?\s*%"
+        r"|[\d,]+(?:\.\d+)?\s+(?:million|billion|thousand)",
+        text,
+    ):
+        value = m.group().strip()
+        # Check if spaCy already caught this span
+        char_start, char_end = m.start(), m.end()
+        already = False
+        for ent in doc.ents:
+            if ent.start_char <= char_start and ent.end_char >= char_end:
+                already = True
+                break
+        if already:
+            continue
+
+        # Grab surrounding context (±80 chars)
+        ctx_start = max(char_start - 80, 0)
+        ctx_end = min(char_end + 80, len(text))
+        context = text[ctx_start:ctx_end].lower()
+
+        matched = False
+        for cat, keywords in _CATEGORY_KEYWORDS.items():
+            if any(kw in context for kw in keywords):
+                data[cat].append(value)
+                matched = True
+        if not matched:
+            if "$" in value:
+                data["awarded"].append(value)
+            elif "%" in value:
+                data["reimbursement_rates"].append(value)
+            else:
+                data["enrollment_snapshots"].append(value)
+
+    # Deduplicate while preserving order
+    return {k: ", ".join(dict.fromkeys(v)) for k, v in data.items()}
 
 
 # ---------------------------------------------------------------------------
 # Main Driver
 # ---------------------------------------------------------------------------
 
+# Number of parallel workers for article scraping
+MAX_WORKERS = 6
+
+
+def _process_article(
+    date: str, title: str, url: str, source: str,
+    session: requests.Session, global_visited: set,
+) -> ArticleRecord:
+    """Process a single article: deep-crawl + NLP.  Runs in a worker thread."""
+    record = ArticleRecord(date=date, title=title, url=url, source=source)
+    try:
+        crawl_body, crawl_pdf, crawl_chunks = deep_crawl_dch(
+            url, session, max_depth=3, visited=global_visited,
+        )
+        record.body = crawl_body
+        record.pdf_text = crawl_pdf
+        record.chunks = crawl_chunks
+
+        if record.body:
+            body_chunks = text_splitter.split_text(record.body)
+            record.chunks = body_chunks + record.chunks
+
+    except Exception as exc:
+        print(f"    Error ({title[:40]}): {exc}")
+
+    # spaCy NLP metric extraction
+    combined_text = record.body + " " + record.pdf_text
+    metrics = analyze_for_metrics(combined_text)
+    for key, val in metrics.items():
+        setattr(record, key, val)
+
+    return record
+
+
 def scrape_dch_to_csv(max_pages=1):
     session = create_session()
     base_url = "https://dch.georgia.gov/news?page="
     all_records = []
     all_chunks_for_embedding = []  # (record_index, chunk_text)
+    global_visited: set = set()     # shared across all workers (thread-safe)
+
+    # --- Phase 1: collect article URLs from all listing pages ---
+    article_jobs: list[tuple[str, str, str, str]] = []  # (date, title, url, src)
+    seen_hrefs: set = set()
 
     for page in range(max_pages):
-        print(f"\n[parser] Page {page + 1}/{max_pages} …")
-
-        # Fetch index page via session (with Wayback API fallback)
-        try:
-            html, src = fetch_html(f"{base_url}{page}", session)
-        except Exception as exc:
-            print(f"  Could not fetch page {page}: {exc}")
+        print(f"\n[parser] Scanning page {page + 1}/{max_pages} …")
+        html, src = fetch_html(f"{base_url}{page}", session)
+        if html is None:
+            print(f"  Could not fetch page {page} — skipping")
             continue
 
         soup = BeautifulSoup(html, "html.parser")
-        seen = set()
-
         for a in soup.find_all("a", href=True):
             match = re.search(r"/announcement/(\d{4}-\d{2}-\d{2})/(.+)", a['href'])
-            if not match or a['href'] in seen:
+            if not match or a['href'] in seen_hrefs:
                 continue
-            seen.add(a['href'])
-
+            seen_hrefs.add(a['href'])
             url = "https://dch.georgia.gov" + a['href']
-            record = ArticleRecord(
-                date=match.group(1),
-                title=a.get_text(strip=True),
-                url=url,
-                source=src,
+            article_jobs.append((match.group(1), a.get_text(strip=True), url, src))
+
+    print(f"\n[parallel] Scraping {len(article_jobs)} articles with {MAX_WORKERS} workers …")
+
+    # --- Phase 2: deep-crawl articles in parallel ---
+    futures = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for date, title, url, src in article_jobs:
+            fut = pool.submit(
+                _process_article, date, title, url, src, session, global_visited,
             )
-            print(f"  [parser] {record.title[:60]} …")
+            futures[fut] = title
 
-            # 1. Fetch article (with Wayback API fallback)
+        for i, fut in enumerate(as_completed(futures), 1):
+            title_short = futures[fut][:55]
             try:
-                art_html, art_src = fetch_html(url, session)
-                record.source = art_src
-                art_soup = BeautifulSoup(art_html, "html.parser")
-
-                # Extract body with boilerplate removal
-                content = (
-                    art_soup.select_one(".field--name-body") or
-                    art_soup.select_one(".field-name-body") or
-                    art_soup.select_one("article") or
-                    art_soup.select_one(".content")
-                )
-                if content:
-                    record.body = clean_text(content.get_text(separator=" ", strip=True))
-                else:
-                    record.body = clean_text(art_soup.get_text(separator=" ", strip=True))
-
-                # 2. Find and extract PDFs (PyPDFLoader + Wayback fallback)
-                for link in art_soup.find_all("a", href=True):
-                    href = link['href']
-                    if href.lower().endswith(".pdf") or "/files/" in href.lower():
-                        pdf_url = href if href.startswith("http") else "https://dch.georgia.gov" + href
-                        pdf_txt, pdf_chunks = extract_pdf_data(pdf_url, session)
-                        record.pdf_text += (" " + pdf_txt)
-                        record.chunks.extend(pdf_chunks)
-
-                record.pdf_text = record.pdf_text.strip()
-
-                # Split article body into chunks too
-                if record.body:
-                    body_chunks = text_splitter.split_text(record.body)
-                    record.chunks = body_chunks + record.chunks
-
+                record = fut.result()
+                all_records.append(record)
+                print(f"  [{i}/{len(futures)}] ✓ {title_short}")
             except Exception as exc:
-                print(f"    Error: {exc}")
+                print(f"  [{i}/{len(futures)}] ✗ {title_short}: {exc}")
 
-            # 3. Analyze text for healthcare metrics (spaCy NLP)
-            combined_text = record.body + " " + record.pdf_text
-            metrics = analyze_for_metrics(combined_text)
-            for key, val in metrics.items():
-                setattr(record, key, val)
+    # Sort records by date (descending) to match the target CSV ordering
+    all_records.sort(key=lambda r: r.date, reverse=True)
 
-            # Track chunks for batch embedding
-            rec_idx = len(all_records)
-            for chunk in record.chunks:
-                all_chunks_for_embedding.append((rec_idx, chunk))
+    # Collect chunks for batch embedding
+    for rec_idx, record in enumerate(all_records):
+        for chunk in record.chunks:
+            all_chunks_for_embedding.append((rec_idx, chunk))
 
-            all_records.append(record)
-            time.sleep(0.5)
-
-    # 4. Generate free local embeddings for all chunks
+    # 3. Generate free local embeddings for all chunks
     if all_chunks_for_embedding:
         print(f"\n[embeddings] Embedding {len(all_chunks_for_embedding)} chunks "
               f"with '{EMBEDDING_MODEL_NAME}' (free, local) …")
@@ -406,4 +597,4 @@ def scrape_dch_to_csv(max_pages=1):
 
 
 if __name__ == "__main__":
-    scrape_dch_to_csv(max_pages=10)
+    scrape_dch_to_csv(max_pages=19)

@@ -14,7 +14,7 @@ import spacy
 from spacy.pipeline import EntityRuler
 from dataclasses import dataclass, asdict, field
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import  , timezone
 
 from sentence_transformers import SentenceTransformer
 from langchain_community.document_loaders import PyPDFLoader
@@ -597,4 +597,4 @@ def scrape_dch_to_csv(max_pages=1):
 
 
 if __name__ == "__main__":
-    scrape_dch_to_csv(max_pages=19)
+    scrape_dch_to_csv(max_pages=1)
